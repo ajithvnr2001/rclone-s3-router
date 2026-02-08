@@ -31,8 +31,8 @@ SOURCE_PATH = "Work Files"
 S3_BUCKET = "workfiles123"
 S3_PREFIX = "work_files_zips/"
 
-AWS_ACCESS_KEY = "key"
-AWS_SECRET_KEY = "keyid"
+AWS_ACCESS_KEY = ""
+AWS_SECRET_KEY = ""
 S3_ENDPOINT = "https://s3.ap-northeast-1.wasabisys.com"
 
 # Tuning
