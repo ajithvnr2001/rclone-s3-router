@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-PYTHON MASTER MAPPER (Auto-Discovery)
-Auto-discovers all subfolders in OneDrive root, scans each,
-and uploads file lists (.txt) + folder index to Wasabi S3.
-
-The zipper and unzipper read from S3 to know which folders to process.
+PYTHON MASTER MAPPER (Auto-Discovery + Large File Detection)
+Auto-discovers all subfolders, scans each for files with sizes,
+separates normal files (≤ threshold) and large files (> threshold),
+and uploads both lists + folder index to Wasabi S3.
 """
 
 import subprocess
 import boto3
+import json
 
 # ============ CONFIGURATION ============
 SOURCE = "onedrive:Work Files"      # rclone remote:path to scan
@@ -18,10 +18,12 @@ S3_PREFIX = "work_files_zips/"
 AWS_ACCESS_KEY = ""
 AWS_SECRET_KEY = ""
 S3_ENDPOINT = "https://s3.ap-northeast-1.wasabisys.com"
+
+LARGE_FILE_THRESHOLD_GB = 20  # Files larger than this go to the large files list
 # =======================================
 
-# Key for the master folder index on S3
 FOLDER_INDEX_KEY = f"{S3_PREFIX}_index/folder_list.txt"
+LARGE_FILE_THRESHOLD_BYTES = LARGE_FILE_THRESHOLD_GB * 1024 * 1024 * 1024
 
 
 def get_s3_client():
@@ -34,19 +36,15 @@ def get_s3_client():
 
 
 def discover_folders():
-    """Auto-discover all top-level subfolders in the OneDrive source path."""
-    root_path = SOURCE
-    print(f"🔍 Discovering folders in: {root_path}")
-
+    """Auto-discover all top-level subfolders in the source path."""
+    print(f"🔍 Discovering folders in: {SOURCE}")
     cmd = [
-        'rclone', 'lsf', root_path,
+        'rclone', 'lsf', SOURCE,
         '--dirs-only',
         '--config=/content/rclone.conf'
     ]
-
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        # rclone lsf returns folder names with trailing /, strip them
         folders = [line.strip().rstrip('/') for line in result.stdout.splitlines() if line.strip()]
         print(f"   📁 Found {len(folders)} folders:")
         for f in folders:
@@ -58,19 +56,18 @@ def discover_folders():
 
 
 def save_folder_index(folders):
-    """Save the master folder list to S3 so zipper/unzipper can auto-discover."""
+    """Save the master folder list to S3."""
     s3 = get_s3_client()
-    folder_data = "\n".join(folders)
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=FOLDER_INDEX_KEY,
-        Body=folder_data.encode('utf-8')
+        Body="\n".join(folders).encode('utf-8')
     )
-    print(f"\n� Saved folder index to S3: {FOLDER_INDEX_KEY}")
+    print(f"\n📋 Saved folder index to S3: {FOLDER_INDEX_KEY}")
 
 
 def check_list_exists(s3, map_key):
-    """Check if a folder's file list already exists on S3."""
+    """Check if a file list already exists on S3."""
     try:
         s3.head_object(Bucket=S3_BUCKET, Key=map_key)
         return True
@@ -78,10 +75,53 @@ def check_list_exists(s3, map_key):
         return False
 
 
+def scan_folder_with_sizes(folder):
+    """
+    Scan a folder using rclone lsjson to get file paths AND sizes.
+    Returns (normal_files, large_files) where each is a list of dicts.
+    normal_files: list of relative paths (strings) for files ≤ threshold
+    large_files: list of dicts {path, size} for files > threshold
+    """
+    folder_path = f"{SOURCE}/{folder}"
+
+    cmd = [
+        'rclone', 'lsjson', folder_path,
+        '-R', '--files-only', '--no-mimetype', '--no-modtime',
+        '--config=/content/rclone.conf'
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        entries = json.loads(result.stdout)
+
+        normal_files = []
+        large_files = []
+
+        for entry in entries:
+            path = entry.get('Path', '')
+            size = entry.get('Size', 0)
+
+            if size > LARGE_FILE_THRESHOLD_BYTES:
+                large_files.append({
+                    'path': path,
+                    'size': size,
+                    'size_gb': round(size / (1024 * 1024 * 1024), 2)
+                })
+            else:
+                normal_files.append(path)
+
+        return normal_files, large_files
+
+    except subprocess.CalledProcessError as e:
+        print(f" ❌ Error: {e.stderr[:80]}")
+        return [], []
+
+
 def run_mapper(force_rescan=False):
     s3 = get_s3_client()
-    print("🚀 PYTHON MASTER MAPPER (Auto-Discovery + Resume)")
-    print("=" * 50)
+    print("🚀 PYTHON MASTER MAPPER (Auto-Discovery + Large File Detection)")
+    print("=" * 60)
+    print(f"   Large file threshold: {LARGE_FILE_THRESHOLD_GB} GB")
     if force_rescan:
         print("   ⚠️  FORCE RESCAN enabled — will re-scan all folders")
 
@@ -94,7 +134,7 @@ def run_mapper(force_rescan=False):
     # 2. Save folder index to S3
     save_folder_index(folders)
 
-    # 3. Check which folders already have file lists (resume)
+    # 3. Resume check
     if not force_rescan:
         already_done = []
         remaining = []
@@ -117,37 +157,56 @@ def run_mapper(force_rescan=False):
 
         folders = remaining
 
-    # 4. Scan each folder and upload file lists
-    print(f"\n📂 Scanning {len(folders)} folders for files...\n")
+    # 4. Scan each folder with size detection
+    print(f"\n📂 Scanning {len(folders)} folders (with size detection)...\n")
+
+    total_normal = 0
+    total_large = 0
 
     for folder in folders:
         clean_name = folder.replace(" ", "_")
         map_key = f"{S3_PREFIX}{clean_name}_List.txt"
-        onedrive_path = f"{SOURCE}/{folder}"
+        large_key = f"{S3_PREFIX}{clean_name}_LargeFiles.json"
 
         print(f"   📂 {folder} ...", end="", flush=True)
 
-        cmd = [
-            'rclone', 'lsf', onedrive_path,
-            '-R', '--files-only',
-            '--config=/content/rclone.conf'
-        ]
+        normal_files, large_files = scan_folder_with_sizes(folder)
 
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            file_list_data = result.stdout
-            file_count = len([l for l in file_list_data.splitlines() if l.strip()])
-
+        # Upload normal files list
+        if normal_files:
+            file_list_data = "\n".join(normal_files)
             s3.put_object(
                 Bucket=S3_BUCKET,
                 Key=map_key,
                 Body=file_list_data.encode('utf-8')
             )
-            print(f" ✅ {file_count} files → {map_key}")
-        except subprocess.CalledProcessError as e:
-            print(f" ❌ Error: {e.stderr[:80]}")
+        else:
+            # Upload empty list so resume doesn't re-scan
+            s3.put_object(Bucket=S3_BUCKET, Key=map_key, Body=b"")
 
-    print("\n🎉 ALL FOLDERS MAPPED SUCCESSFULLY!")
+        # Upload large files list (JSON with paths and sizes)
+        if large_files:
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=large_key,
+                Body=json.dumps(large_files, indent=2).encode('utf-8'),
+                ContentType='application/json'
+            )
+
+        total_normal += len(normal_files)
+        total_large += len(large_files)
+
+        large_info = f", ⚡{len(large_files)} large" if large_files else ""
+        print(f" ✅ {len(normal_files)} files{large_info}")
+
+        # Print large file details
+        if large_files:
+            for lf in large_files:
+                print(f"      🔴 LARGE: {lf['path']} ({lf['size_gb']} GB)")
+
+    print(f"\n🎉 MAPPING COMPLETE!")
+    print(f"   Normal files: {total_normal}")
+    print(f"   Large files:  {total_large} (will be transferred directly)")
 
 
 if __name__ == "__main__":
