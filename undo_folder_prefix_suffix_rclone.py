@@ -5,8 +5,11 @@ Recursively REMOVES "fol..." prefix and "...fol" suffix from folder names.
 Processes bottom-up (deepest folders first) to avoid path breakage.
 Logs progress to S3 for crash-resume on Google Colab.
 
+Note: This restores to the SANITIZED clean name (dots instead of spaces/special chars).
+      Original unsanitized names are not recoverable.
+
 Example:
-  fol...folder...fol/fol...sub1...fol  →  folder/sub1
+  fol...My.Folder.2023...fol/fol...Sub.Dir...fol  →  My.Folder.2023/Sub.Dir
 
 Usage: !python undo_folder_prefix_suffix_rclone.py
 """
