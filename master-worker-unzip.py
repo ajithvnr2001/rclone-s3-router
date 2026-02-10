@@ -30,15 +30,10 @@ import random
 import re
 
 # ============ CONFIGURATION ============
-# Subfolders that were zipped — must match your python_zipper.py config
-SUBFOLDERS = [
-    "Pryor & Morrow Projects", "My Companies"
-]
 
 # Target remote to upload the merged/unzipped files
 # Change this to your destination remote (Google Drive, another OneDrive, etc.)
-TARGET_REMOTE = "gdrive:"           # e.g. "gdrive:", "onedrive2:", etc.
-TARGET_PATH = "Work Files"          # Destination base path on the remote
+DESTINATION = "gdrive:Work Files"    # rclone remote:path (destination to upload to)
 
 # S3 / Wasabi config — must match your python_zipper.py config
 S3_BUCKET = "workfiles123"
@@ -56,6 +51,9 @@ SKIP_UPLOAD = False         # Set True to only unzip locally without uploading
 LOCAL_OUTPUT_DIR = "/content/merged_output"  # Local output when SKIP_UPLOAD=True
 # =======================================
 
+# ============ S3 FOLDER INDEX ============
+FOLDER_INDEX_KEY = f"{S3_PREFIX}_index/folder_list.txt"
+
 # ============ S3 PROGRESS TRACKING ============
 PROGRESS_KEY = f"{S3_PREFIX}_progress/unzipper_progress.json"
 
@@ -67,6 +65,21 @@ def get_s3_client():
         aws_secret_access_key=AWS_SECRET_KEY,
         endpoint_url=S3_ENDPOINT
     )
+
+
+def fetch_folder_list():
+    """Fetch the folder list from S3 (created by mapper.py)."""
+    s3 = get_s3_client()
+    try:
+        response = s3.get_object(Bucket=S3_BUCKET, Key=FOLDER_INDEX_KEY)
+        content = response['Body'].read().decode('utf-8')
+        folders = [line.strip() for line in content.splitlines() if line.strip()]
+        print(f"   📁 Found {len(folders)} folders from S3 index")
+        return folders
+    except Exception as e:
+        print(f"   ❌ Could not fetch folder index from S3: {e}")
+        print(f"   💡 Run mapper.py first to create the folder index.")
+        return []
 
 
 def load_progress():
@@ -227,7 +240,7 @@ def download_unzip_upload_one(s3_key, folder_name, status_name, status_queue):
             subprocess.run(cmd_merge, shell=True)
             status_queue.put((status_name, "SAVED", f"Local: {final_dir}"))
         else:
-            target = f"{TARGET_REMOTE}{TARGET_PATH}/{folder_name}"
+            target = f"{DESTINATION}/{folder_name}"
             status_queue.put((status_name, "UPLOADING", f"→ {target}"))
 
             cmd_upload = [
@@ -393,7 +406,7 @@ def main():
     if SKIP_UPLOAD:
         print(f"   Output     : LOCAL → {LOCAL_OUTPUT_DIR}")
     else:
-        print(f"   Target     : {TARGET_REMOTE}{TARGET_PATH}")
+        print(f"   Target     : {DESTINATION}")
     print(f"   Workers    : {MAX_PARALLEL_WORKERS}")
     print("=" * 55)
 
@@ -431,7 +444,15 @@ def main():
         print("   No previous progress found. Starting fresh.")
     print()
 
-    # 3. Process each subfolder
+    # 3. Fetch folder list from S3 (auto-discovered by mapper.py)
+    print("📁 Fetching folder list from S3...")
+    SUBFOLDERS = fetch_folder_list()
+    if not SUBFOLDERS:
+        print("❌ No folders to process. Run mapper.py first!")
+        return
+    print()
+
+    # 4. Process each subfolder
     m = multiprocessing.Manager()
     q = m.Queue()
 
@@ -449,7 +470,7 @@ def main():
     if SKIP_UPLOAD:
         print(f"   Files extracted to: {LOCAL_OUTPUT_DIR}")
     else:
-        print(f"   Files uploaded to: {TARGET_REMOTE}{TARGET_PATH}")
+        print(f"   Files uploaded to: {DESTINATION}")
 
 
 if __name__ == "__main__":
