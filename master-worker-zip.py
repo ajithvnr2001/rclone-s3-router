@@ -24,12 +24,8 @@ import random
 import re
 
 # ============ CONFIGURATION ============
-SUBFOLDERS = [
-     "Pryor & Morrow Projects","My Companies"
-]
 
-ONEDRIVE_REMOTE = "onedrive:"
-SOURCE_PATH = "Work Files"
+SOURCE = "onedrive:Work Files"      # rclone remote:path (source to zip from)
 S3_BUCKET = "workfiles123"
 S3_PREFIX = "work_files_zips/"
 
@@ -44,6 +40,9 @@ SPLIT_THRESHOLD = 1000      # Files per batch
 DISK_LIMIT_PERCENT = 80     # Trigger split/clean cycle at 80% disk usage
 # =======================================
 
+# ============ S3 FOLDER INDEX ============
+FOLDER_INDEX_KEY = f"{S3_PREFIX}_index/folder_list.txt"
+
 # ============ S3 PROGRESS TRACKING ============
 PROGRESS_KEY = f"{S3_PREFIX}_progress/zipper_progress.json"
 
@@ -54,6 +53,20 @@ def get_s3_client():
         aws_secret_access_key=AWS_SECRET_KEY,
         endpoint_url=S3_ENDPOINT
     )
+
+def fetch_folder_list():
+    """Fetch the folder list from S3 (created by mapper.py)."""
+    s3 = get_s3_client()
+    try:
+        response = s3.get_object(Bucket=S3_BUCKET, Key=FOLDER_INDEX_KEY)
+        content = response['Body'].read().decode('utf-8')
+        folders = [line.strip() for line in content.splitlines() if line.strip()]
+        print(f"   📁 Found {len(folders)} folders from S3 index")
+        return folders
+    except Exception as e:
+        print(f"   ❌ Could not fetch folder index from S3: {e}")
+        print(f"   💡 Run mapper.py first to create the folder index.")
+        return []
 
 def load_progress():
     """Load progress JSON from S3. Returns dict or empty dict on failure."""
@@ -400,6 +413,14 @@ def main():
         print("   No previous progress found. Starting fresh.")
     print()
 
+    # 4. Fetch folder list from S3 (auto-discovered by mapper.py)
+    print("📁 Fetching folder list from S3...")
+    SUBFOLDERS = fetch_folder_list()
+    if not SUBFOLDERS:
+        print("❌ No folders to process. Run mapper.py first!")
+        return
+    print()
+
     for folder in SUBFOLDERS:
         # Skip fully completed folders
         if is_folder_complete(folder):
@@ -434,7 +455,7 @@ def main():
             batch = files[i*SPLIT_THRESHOLD:(i+1)*SPLIT_THRESHOLD]
             part = f"Part{i+1}" if num_parts > 1 else "Full"
             s3_key = f"{S3_PREFIX}{folder.replace(' ','_')}_{part}.zip"
-            tasks.append((batch, f"{ONEDRIVE_REMOTE}{SOURCE_PATH}/{folder}", s3_key, part, folder, q))
+            tasks.append((batch, f"{SOURCE}/{folder}", s3_key, part, folder, q))
 
         monitor_thread = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         monitor_thread.submit(monitor, q, num_parts)
