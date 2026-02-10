@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-PYTHON MASTER WORKER (Final Version)
+PYTHON MASTER WORKER (Final Version + S3 Resume)
 Features:
 - Auto-dependency install (Rclone/Zip)
 - Smart Disk Splitting (Never runs out of space)
 - Robust Cleanup (Force deletes locked folders)
-- Resume Capability (Skips existing S3 files)
+- S3 Progress Tracking (Saves progress JSON to S3 after every completed part)
+- Crash Resume (Reads progress from S3 on startup, skips completed work)
 """
 
 import subprocess
 import sys
 import time
 import boto3
+import json
 import math
 import concurrent.futures
 import multiprocessing
@@ -42,6 +44,9 @@ SPLIT_THRESHOLD = 1000      # Files per batch
 DISK_LIMIT_PERCENT = 80     # Trigger split/clean cycle at 80% disk usage
 # =======================================
 
+# ============ S3 PROGRESS TRACKING ============
+PROGRESS_KEY = f"{S3_PREFIX}_progress/zipper_progress.json"
+
 def get_s3_client():
     return boto3.client(
         service_name='s3',
@@ -49,6 +54,69 @@ def get_s3_client():
         aws_secret_access_key=AWS_SECRET_KEY,
         endpoint_url=S3_ENDPOINT
     )
+
+def load_progress():
+    """Load progress JSON from S3. Returns dict or empty dict on failure."""
+    s3 = get_s3_client()
+    try:
+        response = s3.get_object(Bucket=S3_BUCKET, Key=PROGRESS_KEY)
+        return json.loads(response['Body'].read().decode('utf-8'))
+    except:
+        return {}
+
+def save_progress(progress):
+    """Save progress JSON to S3."""
+    s3 = get_s3_client()
+    try:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=PROGRESS_KEY,
+            Body=json.dumps(progress, indent=2).encode('utf-8'),
+            ContentType='application/json'
+        )
+    except Exception as e:
+        print(f"⚠️  Failed to save progress to S3: {e}")
+
+def mark_part_complete(folder_name, s3_key, files_in_part):
+    """
+    Mark a zip part as completed in the progress file.
+    Stores the S3 key and the list of files it contained.
+    """
+    progress = load_progress()
+    if folder_name not in progress:
+        progress[folder_name] = {"completed_keys": [], "completed_files": []}
+    if s3_key not in progress[folder_name]["completed_keys"]:
+        progress[folder_name]["completed_keys"].append(s3_key)
+    progress[folder_name]["completed_files"].extend(files_in_part)
+    # Deduplicate
+    progress[folder_name]["completed_files"] = list(set(progress[folder_name]["completed_files"]))
+    save_progress(progress)
+
+def mark_folder_complete(folder_name):
+    """Mark an entire folder as fully completed."""
+    progress = load_progress()
+    if folder_name not in progress:
+        progress[folder_name] = {"completed_keys": [], "completed_files": []}
+    progress[folder_name]["folder_complete"] = True
+    save_progress(progress)
+
+def get_completed_files(folder_name):
+    """Get the set of files already successfully zipped & uploaded for a folder."""
+    progress = load_progress()
+    if folder_name in progress:
+        return set(progress[folder_name].get("completed_files", []))
+    return set()
+
+def is_folder_complete(folder_name):
+    """Check if folder was fully processed in a previous run."""
+    progress = load_progress()
+    return progress.get(folder_name, {}).get("folder_complete", False)
+
+def is_key_complete(folder_name, s3_key):
+    """Check if a specific S3 key was already uploaded."""
+    progress = load_progress()
+    return s3_key in progress.get(folder_name, {}).get("completed_keys", [])
+# ================================================
 
 def get_folder_size_mb(path):
     """Calculates folder size safely"""
@@ -93,11 +161,13 @@ def pipeline_worker(task_data):
     """
     The Core Logic:
     1. Checks dependencies.
-    2. loops through files.
+    2. Loops through files.
     3. Monitor disk.
     4. Splits if disk is full.
+    5. Saves progress to S3 after each completed part.
+    6. On resume, skips already-completed parts and files.
     """
-    (original_file_list, folder_path, base_s3_key, part_name, status_queue) = task_data
+    (original_file_list, folder_path, base_s3_key, part_name, folder_name, status_queue) = task_data
     s3 = get_s3_client()
 
     # === SAFEGUARD: DEPENDENCY CHECK ===
@@ -108,13 +178,30 @@ def pipeline_worker(task_data):
         status_queue.put((part_name, "ERROR", "Zip Missing"))
         return
 
+    # === RESUME: Filter out already completed files ===
+    completed_files = get_completed_files(folder_name)
+    if completed_files:
+        before = len(original_file_list)
+        original_file_list = [f for f in original_file_list if f not in completed_files]
+        skipped = before - len(original_file_list)
+        if skipped > 0:
+            status_queue.put((part_name, "RESUMED", f"Skipped {skipped} done files"))
+        if not original_file_list:
+            status_queue.put((part_name, "SKIPPED", "All files done (resumed)"))
+            return
+
     remaining_files = original_file_list[:]
     split_index = 0
 
-    # === CHECK IF FULL PART ALREADY EXISTS ===
+    # === CHECK IF FULL PART ALREADY EXISTS ON S3 ===
+    if is_key_complete(folder_name, base_s3_key):
+        status_queue.put((part_name, "SKIPPED", "Exists in progress"))
+        return
     try:
         s3.head_object(Bucket=S3_BUCKET, Key=base_s3_key)
         status_queue.put((part_name, "SKIPPED", "Exists on S3"))
+        # Also record in progress
+        mark_part_complete(folder_name, base_s3_key, original_file_list)
         return
     except:
         pass
@@ -130,6 +217,19 @@ def pipeline_worker(task_data):
             base = base_s3_key.replace(f".{ext}", "")
             current_s3_key = f"{base}_Split{split_index}.{ext}"
             current_status_name = f"{part_name}.{split_index}"
+
+        # === RESUME: Check if this specific split key already done ===
+        if is_key_complete(folder_name, current_s3_key):
+            status_queue.put((current_status_name, "SKIPPED", "Split exists (resumed)"))
+            split_index += 1
+            continue
+        try:
+            s3.head_object(Bucket=S3_BUCKET, Key=current_s3_key)
+            status_queue.put((current_status_name, "SKIPPED", "Split on S3"))
+            split_index += 1
+            continue
+        except:
+            pass
 
         # Unique Temp Directory
         temp_dir = f"/content/temp_{part_name}_{split_index}_{random.randint(1000,9999)}"
@@ -180,10 +280,8 @@ def pipeline_worker(task_data):
 
             # Calculate what is left
             downloaded_set = set(downloaded_files)
-            # Filter remaining_files to exclude what we just got
             new_remaining = []
             for f in remaining_files:
-                # We normalize paths to ensure matching works across OS types
                 norm_f = f.replace('\\', '/')
                 if norm_f not in downloaded_set and f not in downloaded_set:
                     new_remaining.append(f)
@@ -195,7 +293,6 @@ def pipeline_worker(task_data):
                 status_queue.put((current_status_name, "ZIPPING", f"{len(downloaded_files)} files"))
                 if os.path.exists(list_path): os.remove(list_path)
 
-                # Use list-based subprocess.run to avoid shell issues with '&' and other special chars
                 cmd_zip = ["zip", "-0", "-r", "-q", local_zip, "."]
                 subprocess.run(cmd_zip, cwd=temp_dir)
 
@@ -203,7 +300,10 @@ def pipeline_worker(task_data):
                     file_size = os.path.getsize(local_zip)
                     status_queue.put((current_status_name, "UPLOADING", f"{int(file_size/(1024*1024))} MB"))
                     s3.upload_file(local_zip, S3_BUCKET, current_s3_key)
-                    status_queue.put((current_status_name, "COMPLETED", "Saved to S3"))
+
+                    # === SAVE PROGRESS TO S3 ===
+                    mark_part_complete(folder_name, current_s3_key, downloaded_files)
+                    status_queue.put((current_status_name, "COMPLETED", "Saved to S3 ✓"))
                 else:
                     raise Exception(f"Zip file {zip_filename} not found after creation attempt")
             else:
@@ -255,7 +355,6 @@ def monitor(queue, num_parts):
         print(f"{'PART':<12} | {'STATUS':<15} | {'INFO':<25}\n" + "-"*55)
 
         done = 0
-        # Natural sort: Part1, Part2, ..., Part10 instead of Part1, Part10, Part2
         def natural_sort_key(s):
             return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
         sorted_keys = sorted(statuses.keys(), key=natural_sort_key)
@@ -263,9 +362,9 @@ def monitor(queue, num_parts):
         for p in sorted_keys:
             state, info = statuses[p]
             if state in ["COMPLETED", "SKIPPED", "ERROR"]: done += 1
-            # Color coding for better visibility
             if state == "ERROR": row = f"\033[91m{p:<12} | {state:<15} | {info:<25}\033[0m"
-            elif state == "COMPLETED": row = f"\033[92m{p:<12} | {state:<15} | {info:<25}\033[0m"
+            elif state in ["COMPLETED", "SKIPPED"]: row = f"\033[92m{p:<12} | {state:<15} | {info:<25}\033[0m"
+            elif state == "RESUMED": row = f"\033[96m{p:<12} | {state:<15} | {info:<25}\033[0m"
             elif "DISK FULL" in state: row = f"\033[93m{p:<12} | {state:<15} | {info:<25}\033[0m"
             else: row = f"{p:<12} | {state:<15} | {info:<25}"
             print(row)
@@ -274,7 +373,7 @@ def monitor(queue, num_parts):
         time.sleep(1)
 
 def main():
-    print("🚀 PYTHON MASTER WORKER (Disk-Smart Edition)")
+    print("🚀 PYTHON MASTER WORKER (Disk-Smart + S3 Resume)")
     print("🛠️  Checking dependencies...")
 
     # 1. Install Zip
@@ -287,11 +386,42 @@ def main():
 
     print("✅ Dependencies ready!\n")
 
+    # 3. Load progress from S3
+    print("📋 Loading progress from S3...")
+    progress = load_progress()
+    if progress:
+        for fname, pdata in progress.items():
+            done_keys = len(pdata.get("completed_keys", []))
+            done_files = len(pdata.get("completed_files", []))
+            is_done = pdata.get("folder_complete", False)
+            status = "✅ COMPLETE" if is_done else f"⏳ {done_keys} parts, {done_files} files done"
+            print(f"   {fname}: {status}")
+    else:
+        print("   No previous progress found. Starting fresh.")
+    print()
+
     for folder in SUBFOLDERS:
+        # Skip fully completed folders
+        if is_folder_complete(folder):
+            print(f"⏭️  Skipping {folder} (fully completed in previous run)")
+            continue
+
         print(f"📦 Processing Map: {folder}")
         files = fetch_map(folder)
         if not files:
             print("   ⚠️  No map found on S3. Skipping.")
+            continue
+
+        # Filter out already-completed files
+        completed = get_completed_files(folder)
+        original_count = len(files)
+        files = [f for f in files if f not in completed]
+        if completed:
+            print(f"   ♻️  Resuming: {original_count - len(files)} files already done, {len(files)} remaining")
+
+        if not files:
+            print(f"   ✅ All files already completed!")
+            mark_folder_complete(folder)
             continue
 
         num_parts = math.ceil(len(files) / SPLIT_THRESHOLD)
@@ -304,13 +434,19 @@ def main():
             batch = files[i*SPLIT_THRESHOLD:(i+1)*SPLIT_THRESHOLD]
             part = f"Part{i+1}" if num_parts > 1 else "Full"
             s3_key = f"{S3_PREFIX}{folder.replace(' ','_')}_{part}.zip"
-            tasks.append((batch, f"{ONEDRIVE_REMOTE}{SOURCE_PATH}/{folder}", s3_key, part, q))
+            tasks.append((batch, f"{ONEDRIVE_REMOTE}{SOURCE_PATH}/{folder}", s3_key, part, folder, q))
 
         monitor_thread = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         monitor_thread.submit(monitor, q, num_parts)
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as exe:
             exe.map(pipeline_worker, tasks)
+
+        # Mark folder complete after all parts finish
+        mark_folder_complete(folder)
+        print(f"\n✅ {folder} — ALL PARTS DONE\n")
+
+    print("\n🏁 ALL FOLDERS COMPLETE!")
 
 if __name__ == "__main__":
     main()
