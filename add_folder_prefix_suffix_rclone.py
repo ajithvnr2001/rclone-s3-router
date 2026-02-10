@@ -1,12 +1,14 @@
 """
 Add Folder Prefix/Suffix (fol...name...fol) - RCLONE VERSION
 
-Recursively renames ALL folders by adding "fol..." prefix and "...fol" suffix.
+Recursively renames ALL folders:
+  1. Sanitizes names: removes special chars & spaces, replaces with "."
+  2. Wraps with "fol..." prefix and "...fol" suffix
 Processes bottom-up (deepest folders first) to avoid path breakage.
 Logs progress to S3 for crash-resume on Google Colab.
 
 Example:
-  folder/sub1/sub2  →  fol...folder...fol/fol...sub1...fol/fol...sub2...fol
+  My Folder (2023)/Sub Dir!  →  fol...My.Folder.2023...fol/fol...Sub.Dir...fol
 
 Usage: !python add_folder_prefix_suffix_rclone.py
 """
@@ -14,6 +16,7 @@ Usage: !python add_folder_prefix_suffix_rclone.py
 import subprocess
 import json
 import os
+import re
 import time
 
 # ============ CONFIGURATION ============
@@ -108,6 +111,25 @@ def is_already_renamed(name):
     return name.startswith(PREFIX) and name.endswith(SUFFIX)
 
 
+def sanitize_name(name):
+    """Clean folder name: replace spaces & special chars with dots.
+
+    Rules:
+      - Keep only alphanumeric, dots, hyphens, underscores
+      - Replace everything else (spaces, brackets, etc.) with "."
+      - Collapse consecutive dots into one
+      - Strip leading/trailing dots
+    """
+    # Replace any non-alphanumeric/dot/hyphen/underscore with a dot
+    cleaned = re.sub(r'[^\w.\-]', '.', name)
+    # Collapse multiple consecutive dots
+    cleaned = re.sub(r'\.{2,}', '.', cleaned)
+    # Strip leading/trailing dots
+    cleaned = cleaned.strip('.')
+    # If everything was stripped, fall back to original (safety net)
+    return cleaned if cleaned else name
+
+
 def list_all_folders():
     """List all folders recursively with a single API call."""
     print("📂 Listing all folders recursively (single API call)...")
@@ -196,8 +218,9 @@ def main():
             stats["skipped"] += 1
             continue
 
-        # Build new name and path
-        new_name = f"{PREFIX}{name}{SUFFIX}"
+        # Sanitize name (remove special chars/spaces) then wrap
+        clean = sanitize_name(name)
+        new_name = f"{PREFIX}{clean}{SUFFIX}"
         parent = os.path.dirname(full_path)
         new_path = f"{parent}/{new_name}" if parent else new_name
 
