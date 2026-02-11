@@ -537,3 +537,103 @@ python python_unzipper.py
 ```
 
 All three scripts are **idempotent** — safe to run multiple times. They skip completed work automatically.
+
+---
+
+## Detailed Example: Splitting 29,566 Scattered Files
+
+If you have a folder `Work Files/Archive` with **29,566 files** scattered across hundreds of nested subfolders, here is exactly how the system handles it:
+
+### 1. The Mapping (Logical View)
+`mapper.py` ignores the folder structure during scanning and produces a **flat list** of relative paths.
+- **Total files:** 29,566
+- **Threshold:** 1,000 files per batch
+- **Result:** 30 logical batches are planned.
+  - `Part1`: Files 1 to 1,000
+  - `Part2`: Files 1,001 to 2,000
+  - ...
+  - `Part30`: Files 29,001 to 29,566
+
+### 2. The Zipping (Physical View)
+The `zipper.py` takes these batches and processes them. But it also respects **size limits** (20GB) and **disk space**.
+
+**Case A: Small Files (Ideal)**
+If each batch of 1,000 files is small (e.g., 2GB total), you get exactly 30 zip files on S3:
+`Archive_Part1.zip`, `Archive_Part2.zip`, ..., `Archive_Part30.zip`.
+
+**Case B: Large/Scattered Files (Reality)**
+If `Part1` contains 1,000 files, but after downloading the first **400 files** the local folder hits the **20GB Size Cap**:
+1. Zipper stops downloading.
+2. It zips those 400 files and uploads as `Archive_Part1.zip`.
+3. It keeps the remaining 600 files in the queue for the same batch.
+4. It downloads the next batch of files from the remaining 600, hits the limit again, and uploads `Archive_Part1_Split1.zip`.
+5. It finishes the last subset as `Archive_Part1_Split2.zip`.
+
+### 3. The Unzipping (Reconstruction)
+The `unzipper.py` reconstructs everything perfectly because:
+- `unzip` restores the **full nested path** stored inside each zip (e.g., `Deeply/Nested/Folder/File.pdf`).
+- `rclone copy` merges the contents of all zips (`Part1`, `Part1_Split1`, `Part2`, etc.) into the **same destination path**.
+
+**Result on Destination:**
+One single `Archive/` folder with all 29,566 files in their original nested subfolders, exactly as they were on the source.
+
+---
+
+## Deep Dive: Why Merging Works (Folder Preservation)
+
+You might wonder: *If I have 10 zip parts, and each has its own "Part1" name, how do they merge back into one folder?*
+
+The secret is in **Relative Paths** and **Additive Copies**.
+
+### 1. Relative Paths inside the Zip
+When `zipper.py` creates a zip (e.g., `Archive_Part1.zip`), it uses the `-r` (recursive) flag. This stores the **entire subfolder path** relative to the folder being zipped.
+
+Imagine `Archive/` contains:
+- `2024/Photos/A.jpg`
+- `2024/Photos/B.jpg`
+
+If `A.jpg` is in `Part1.zip` and `B.jpg` is in `Part2.zip`, the internal structure looks like this:
+
+**Part1.zip Internal Structure:**
+```
+Archive_Part1.zip
+└── 2024/
+    └── Photos/
+        └── A.jpg
+```
+
+**Part2.zip Internal Structure:**
+```
+Archive_Part2.zip
+└── 2024/
+    └── Photos/
+        └── B.jpg
+```
+
+### 2. The Unzipping Step
+When `unzipper.py` extracts `Part1.zip` to `temp_unzip/`:
+`temp_unzip/` now contains `2024/Photos/A.jpg`.
+
+### 3. The "Additive" Rclone Copy
+The command `rclone copy temp_unzip/ DESTINATION/` is the magic step.
+1. It looks at the destination.
+2. It sees `2024/Photos/` doesn't exist yet (if this is the first part).
+3. It creates the folder and uploads `A.jpg`.
+
+Now, when `Part2.zip` is processed:
+1. `temp_unzip/` is cleaned and now contains `2024/Photos/B.jpg`.
+2. `rclone copy` looks at the destination.
+3. It sees `2024/Photos/` **already exists**.
+4. It **merges** the contents: it adds `B.jpg` into the existing `Photos/` folder.
+
+**Final Result on Destination:**
+```
+DESTINATION/
+└── Archive/
+    └── 2024/
+        └── Photos/
+            ├── A.jpg (from Part 1)
+            └── B.jpg (from Part 2)
+```
+
+**Conclusion:** The names of the zip files (`Part1_Split1`, etc.) are just containers for transport. The **data inside them** knows its original home (its path), and `rclone` ensures they all move back into that same home at the destination.
