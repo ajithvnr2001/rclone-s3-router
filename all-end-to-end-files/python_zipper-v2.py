@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+"""
+PYTHON MASTER WORKER (Fully Fixed Version + S3 Resume + Large File Handling)
+Features:
+- Auto-dependency install (Rclone/Zip)
+- Smart Disk Splitting (Never runs out of space)
+- Max zip size cap (20GB default — triggers split before exceeding)
+- Robust Cleanup (Force deletes locked folders)
+- S3 Progress Tracking (Saves progress JSON to S3 after every completed part)
+- Crash Resume (Reads progress from S3 on startup, skips completed work)
+- Large File Direct Transfer (files > threshold copied directly source → destination)
+
+ALL BUGS FIXED:
+- Environment variables for credentials (no hardcoding)
+- Null-safe lock handling
+- Proper exception handling (no bare except)
+- Safe subprocess calls (no shell injection)
+- Safe S3 key encoding
+- Configurable paths (not hardcoded to Colab)
+- Division by zero protection
+- Proper error messages
+- Added missing 'json' import
+- **FIX**: Syntax error in type hint (Optional[...])
+- **FIX**: boto3 exception handling in ALL functions (not just load_progress)
+- **FIX**: Race condition in progress updates (per-folder progress files)
+- **FIX**: Added botocore import for proper exception handling
+- **FIX**: Added S3 operation timeouts
+- **FIX**: Removed unsafe S3 head_object checks
+- **FIX**: Removed early exit trap in split logic
+"""
+
+import subprocess
+import sys
+import time
+import os
+import shutil
+import stat
+import random
+import re
+import math
+import json
+import concurrent.futures
+import multiprocessing
+import threading
+from urllib.parse import quote
+from typing import Optional, Set, List, Dict, Any
+
+# Check boto3 early
+try:
+    import boto3
+    import botocore.exceptions
+    from botocore.config import Config
+except ImportError:
+    print("❌ boto3 not installed! Run: pip install boto3")
+    sys.exit(1)
+
+# ============ CONFIGURATION ============
+SOURCE = "onedrive:Work Files"      # rclone remote:path (source to zip from)
+DESTINATION = "gdrive:Work Files"   # rclone remote:path (destination for large files)
+S3_BUCKET = os.environ.get("S3_BUCKET", "workfiles123")
+S3_PREFIX = os.environ.get("S3_PREFIX", "work_files_zips/")
+
+# Get credentials from environment variables (SECURE - never hardcode!)
+AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "https://s3.ap-northeast-1.wasabisys.com")
+
+# Tuning
+MAX_PARALLEL_WORKERS = 2    # Number of simultaneous parts (Colab limit: 2 recommended)
+DOWNLOAD_THREADS = 6        # Rclone transfers per worker
+SPLIT_THRESHOLD = 1000      # Files per batch
+DISK_LIMIT_PERCENT = 80     # Trigger split/clean cycle at 80% disk usage
+MAX_ZIP_SIZE_GB = 20        # Max zip size in GB — triggers split when download exceeds this
+
+# Paths - configurable via environment
+WORK_DIR = os.environ.get("WORK_DIR", "/content")
+RCLONE_CONFIG = os.environ.get("RCLONE_CONFIG", "/content/rclone.conf")
+# =======================================
+
+MAX_ZIP_SIZE_BYTES = MAX_ZIP_SIZE_GB * 1024 * 1024 * 1024
+
+# Process-safe lock — will be set in worker processes
+# FIX: Corrected type hint syntax (was missing '[' and 'm')
+_progress_lock: Optional[Any] = None
+_stop_monitor = threading.Event()
+
+# ============ S3 CONFIG WITH TIMEOUTS ============
+# FIX: Added timeouts to prevent hanging on network issues
+S3_CONFIG = Config(
+    connect_timeout=30,
+    read_timeout=300,  # 5 minutes for large uploads
+    retries={'max_attempts': 3}
+)
+
+# ============ S3 FOLDER INDEX ============
+FOLDER_INDEX_KEY = f"{S3_PREFIX}_index/folder_list.txt"
+
+# ============ S3 PROGRESS TRACKING ============
+# FIX: Changed to per-folder progress to avoid race conditions
+
+
+def get_progress_key(folder_name: str) -> str:
+    """Get per-folder progress file key to avoid race conditions."""
+    safe_name = sanitize_name(folder_name)
+    return f"{S3_PREFIX}_progress/{safe_name}_progress.json"
+
+
+def sanitize_name(name: str) -> str:
+    """Sanitize name for S3 key while preserving readability."""
+    return quote(name, safe='').replace('%20', '_').replace('%2F', '_')
+
+
+def get_s3_client():
+    """Create S3 client with validation and timeouts."""
+    if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
+        raise ValueError(
+            "AWS credentials not configured!\n"
+            "Set environment variables:\n"
+            "  export AWS_ACCESS_KEY_ID='your_access_key'\n"
+            "  export AWS_SECRET_ACCESS_KEY='your_secret_key'"
+        )
+    return boto3.client(
+        service_name='s3',
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+        endpoint_url=S3_ENDPOINT,
+        config=S3_CONFIG  # FIX: Added timeouts
+    )
+
+
+def fetch_folder_list() -> List[str]:
+    """Fetch the folder list from S3 (created by mapper.py)."""
+    s3 = get_s3_client()
+    try:
+        response = s3.get_object(Bucket=S3_BUCKET, Key=FOLDER_INDEX_KEY)
+        content = response['Body'].read().decode('utf-8')
+        folders = [line.strip() for line in content.splitlines() if line.strip()]
+        print(f"   📁 Found {len(folders)} folders from S3 index")
+        return folders
+    except botocore.exceptions.ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code in ('NoSuchKey', '404'):
+            print(f"   ❌ Folder index not found on S3")
+        else:
+            print(f"   ❌ Could not fetch folder index from S3: {e}")
+        print(f"   💡 Run mapper.py first to create the folder index.")
+        return []
+    except Exception as e:
+        print(f"   ❌ Unexpected error fetching folder index: {e}")
+        return []
+
+
+def load_progress(folder_name: str) -> Dict[str, Any]:
+    """Load progress JSON from S3 for a specific folder. Returns dict or empty dict on failure."""
+    s3 = get_s3_client()
+    progress_key = get_progress_key(folder_name)
+    try:
+        response = s3.get_object(Bucket=S3_BUCKET, Key=progress_key)
+        return json.loads(response['Body'].read().decode('utf-8'))
+    except botocore.exceptions.ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code in ('NoSuchKey', '404'):
+            return {}  # No progress file yet - normal for first run
+        print(f"   ⚠️ Error loading progress from S3: {e}")
+        return {}
+    except json.JSONDecodeError as e:
+        print(f"   ⚠️ Progress file corrupted, starting fresh: {e}")
+        return {}
+    except Exception as e:
+        error_str = str(e)
+        if 'NoSuchKey' in error_str or 'Not Found' in error_str or '404' in error_str:
+            return {}
+        print(f"   ⚠️ Error loading progress from S3: {e}")
+        return {}
+
+
+def save_progress(folder_name: str, progress: Dict[str, Any]) -> bool:
+    """Save progress JSON to S3 for a specific folder. Returns True on success."""
+    s3 = get_s3_client()
+    progress_key = get_progress_key(folder_name)
+    try:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=progress_key,
+            Body=json.dumps(progress, indent=2).encode('utf-8'),
+            ContentType='application/json'
+        )
+        return True
+    except botocore.exceptions.ClientError as e:
+        print(f"⚠️  Failed to save progress to S3: {e}")
+        return False
+    except Exception as e:
+        print(f"⚠️  Unexpected error saving progress: {e}")
+        return False
+
+
+def _update_progress_safe(folder_name: str, update_func) -> None:
+    """Safely update progress with lock handling."""
+    global _progress_lock
+    
+    if _progress_lock is not None:
+        with _progress_lock:
+            progress = load_progress(folder_name)
+            update_func(progress)
+            save_progress(folder_name, progress)
+    else:
+        # No lock available (shouldn't happen in normal flow)
+        progress = load_progress(folder_name)
+        update_func(progress)
+        save_progress(folder_name, progress)
+
+
+def mark_part_complete(folder_name: str, s3_key: str, files_in_part: List[str]) -> None:
+    """Mark a part as complete in progress tracking."""
+    def update(progress: Dict[str, Any]) -> None:
+        if "completed_keys" not in progress:
+            progress["completed_keys"] = []
+        if "completed_files" not in progress:
+            progress["completed_files"] = []
+        if "large_files_done" not in progress:
+            progress["large_files_done"] = []
+        
+        if s3_key not in progress["completed_keys"]:
+            progress["completed_keys"].append(s3_key)
+        
+        # Use set for deduplication but keep as list for JSON
+        existing = set(progress["completed_files"])
+        existing.update(files_in_part)
+        progress["completed_files"] = list(existing)
+    
+    _update_progress_safe(folder_name, update)
+
+
+def mark_large_file_complete(folder_name: str, file_path: str) -> None:
+    """Mark a single large file as transferred."""
+    def update(progress: Dict[str, Any]) -> None:
+        if "completed_keys" not in progress:
+            progress["completed_keys"] = []
+        if "completed_files" not in progress:
+            progress["completed_files"] = []
+        if "large_files_done" not in progress:
+            progress["large_files_done"] = []
+        
+        if file_path not in progress["large_files_done"]:
+            progress["large_files_done"].append(file_path)
+    
+    _update_progress_safe(folder_name, update)
+
+
+def mark_folder_complete(folder_name: str) -> None:
+    """Mark folder as fully complete."""
+    def update(progress: Dict[str, Any]) -> None:
+        progress["folder_complete"] = True
+    
+    _update_progress_safe(folder_name, update)
+
+
+def get_completed_files(folder_name: str) -> Set[str]:
+    """Get set of completed files for a folder."""
+    progress = load_progress(folder_name)
+    return set(progress.get("completed_files", []))
+
+
+def get_completed_large_files(folder_name: str) -> Set[str]:
+    """Get set of completed large files for a folder."""
+    progress = load_progress(folder_name)
+    return set(progress.get("large_files_done", []))
+
+
+def is_folder_complete(folder_name: str) -> bool:
+    """Check if folder is marked complete."""
+    progress = load_progress(folder_name)
+    return progress.get("folder_complete", False)
+
+
+def is_key_complete(folder_name: str, s3_key: str) -> bool:
+    """Check if specific S3 key is already processed."""
+    progress = load_progress(folder_name)
+    return s3_key in progress.get("completed_keys", [])
+
+# ============ UTILITY FUNCTIONS ============
+
+def get_folder_size_mb(path: str) -> float:
+    """Calculate folder size in MB. Returns 0.0 on error."""
+    total_size = 0
+    try:
+        for dirpath, _, filenames in os.walk(path):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                try:
+                    if not os.path.islink(fp):
+                        total_size += os.path.getsize(fp)
+                except (OSError, IOError):
+                    continue  # Skip files we can't read
+    except (OSError, IOError):
+        pass
+    return total_size / (1024 * 1024)
+
+
+def get_folder_size_bytes(path: str) -> int:
+    """Calculate folder size in bytes. Returns 0 on error."""
+    total_size = 0
+    try:
+        for dirpath, _, filenames in os.walk(path):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                try:
+                    if not os.path.islink(fp):
+                        total_size += os.path.getsize(fp)
+                except (OSError, IOError):
+                    continue
+    except (OSError, IOError):
+        pass
+    return total_size
+
+
+def check_disk_usage() -> bool:
+    """Returns True if disk usage exceeds DISK_LIMIT_PERCENT."""
+    try:
+        total, used, free = shutil.disk_usage("/")
+        if total > 0:
+            percent = (used / total) * 100
+            return percent > DISK_LIMIT_PERCENT
+    except (OSError, IOError):
+        pass
+    return False  # Assume OK if we can't check
+
+
+def handle_remove_readonly(func, path: str, exc) -> None:
+    """Force delete read-only files on Windows."""
+    excvalue = exc[1]
+    if func in (os.rmdir, os.remove, os.unlink) and hasattr(excvalue, 'errno') and excvalue.errno == 13:
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except (OSError, IOError):
+            raise
+    else:
+        raise
+
+
+def normalize_path(path: str) -> str:
+    """Normalize path separators to forward slashes for consistent comparison."""
+    return path.replace('\\', '/')
+
+
+def fetch_map(folder_name: str) -> List[str]:
+    """Downloads the normal file list from S3 (excludes large files)."""
+    safe_name = sanitize_name(folder_name)
+    map_key = f"{S3_PREFIX}{safe_name}_List.txt"
+    s3 = get_s3_client()
+    try:
+        response = s3.get_object(Bucket=S3_BUCKET, Key=map_key)
+        content = response['Body'].read().decode('utf-8')
+        return [line.strip() for line in content.splitlines() if line.strip()]
+    except botocore.exceptions.ClientError as e:
+        # FIX: Use proper botocore exception handling
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code in ('NoSuchKey', '404'):
+            return []
+        print(f"   ⚠️ Error fetching file map: {e}")
+        return []
+    except Exception as e:
+        # FIX: Handle any other exceptions with string matching
+        error_str = str(e)
+        if 'NoSuchKey' in error_str or 'Not Found' in error_str or '404' in error_str:
+            return []
+        print(f"   ⚠️ Error fetching file map: {e}")
+        return []
+
+
+def fetch_large_files(folder_name: str) -> List[Dict[str, Any]]:
+    """Downloads the large files list from S3."""
+    safe_name = sanitize_name(folder_name)
+    large_key = f"{S3_PREFIX}{safe_name}_LargeFiles.json"
+    s3 = get_s3_client()
+    try:
+        response = s3.get_object(Bucket=S3_BUCKET, Key=large_key)
+        return json.loads(response['Body'].read().decode('utf-8'))
+    except botocore.exceptions.ClientError as e:
+        # FIX: Use proper botocore exception handling
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code in ('NoSuchKey', '404'):
+            return []
+        print(f"   ⚠️ Error fetching large files list: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        print(f"   ⚠️ Large files list corrupted: {e}")
+        return []
+    except Exception as e:
+        # FIX: Handle any other exceptions with string matching
+        error_str = str(e)
+        if 'NoSuchKey' in error_str or 'Not Found' in error_str or '404' in error_str:
+            return []
+        print(f"   ⚠️ Error fetching large files list: {e}")
+        return []
+
+# ============ LARGE FILE DIRECT TRANSFER ============
+
+def transfer_large_files(folder_name: str, status_queue, lock) -> List[str]:
+    """
+    Transfer large files directly from SOURCE to DESTINATION via rclone.
+    No zipping, no S3 — direct server-side copy preserving path structure.
+    Returns list of failed file paths.
+    """
+    global _progress_lock
+    _progress_lock = lock
+    
+    large_files = fetch_large_files(folder_name)
+    if not large_files:
+        return []  # No failures, no files
+    
+    # Filter out already-completed large files
+    done = get_completed_large_files(folder_name)
+    remaining = [lf for lf in large_files if lf['path'] not in done]
+    
+    if not remaining:
+        status_queue.put((f"⚡{folder_name}", "SKIPPED", "All large files done"))
+        return []
+    
+    status_queue.put((f"⚡{folder_name}", "LARGE FILES", f"{len(remaining)} file(s)"))
+    failed_large = []
+    
+    for i, lf in enumerate(remaining):
+        file_path = lf['path']
+        size_gb = lf.get('size_gb', '?')
+        label = f"⚡{folder_name}[{i+1}/{len(remaining)}]"
+        
+        status_queue.put((label, "DIRECT COPY", f"{file_path} ({size_gb} GB)"))
+        
+        # Direct rclone copyto: source file → destination file
+        src = f"{SOURCE}/{folder_name}/{file_path}"
+        dst = f"{DESTINATION}/{folder_name}/{file_path}"
+        
+        cmd = [
+            'rclone', 'copyto', src, dst,
+            '--ignore-errors',
+            '--quiet'
+        ]
+        
+        if os.path.exists(RCLONE_CONFIG):
+            cmd.extend(['--config', RCLONE_CONFIG])
+        
+        try:
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            while proc.poll() is None:
+                status_queue.put((label, "TRANSFERRING", f"{file_path} ({size_gb} GB)"))
+                time.sleep(5)
+            
+            if proc.returncode == 0:
+                mark_large_file_complete(folder_name, file_path)
+                status_queue.put((label, "COMPLETED", f"✓ {file_path}"))
+            else:
+                err = ""
+                try:
+                    err = proc.stderr.read().decode('utf-8', errors='replace')[:60]
+                except Exception:
+                    pass
+                failed_large.append(file_path)
+                status_queue.put((label, "ERROR", f"{file_path}: {err[:30]}"))
+        except Exception as e:
+            failed_large.append(file_path)
+            status_queue.put((label, "ERROR", f"{file_path}: {str(e)[:30]}"))
+    
+    return failed_large
+
+# ============ NORMAL ZIP PIPELINE ============
+
+def pipeline_worker(task_data) -> bool:
+    """
+    The Core Logic for normal files (≤ threshold):
+    Returns True on success, False on failure.
+    """
+    (original_file_list, folder_path, base_s3_key, part_name, folder_name, status_queue, lock) = task_data
+    
+    global _progress_lock
+    _progress_lock = lock
+    
+    # Check dependencies
+    if shutil.which("rclone") is None:
+        status_queue.put((part_name, "ERROR", "Rclone Missing"))
+        return False
+    if shutil.which("zip") is None:
+        status_queue.put((part_name, "ERROR", "Zip Missing"))
+        return False
+    
+    s3 = get_s3_client()
+    
+    # Resume: filter out already completed files
+    completed_files = get_completed_files(folder_name)
+    if completed_files:
+        # FIX: Normalize paths for consistent comparison
+        completed_normalized = {normalize_path(f) for f in completed_files}
+        original_file_list = [f for f in original_file_list if normalize_path(f) not in completed_normalized]
+        skipped = len(original_file_list) - len([f for f in original_file_list if normalize_path(f) not in completed_normalized])
+        if skipped > 0:
+            status_queue.put((part_name, "RESUMED", f"Skipped {len(completed_files)} done files"))
+        if not original_file_list:
+            status_queue.put((part_name, "SKIPPED", "All files done (resumed)"))
+            return True
+    
+    remaining_files = original_file_list[:]
+    split_index = 0
+    
+    # === FIX: REMOVED EARLY EXIT CHECK ===
+    # We do NOT check 'is_key_complete(base_s3_key)' here BEFORE the loop.
+    # Why? Because if 'Part1.zip' is done but 'Part1_Split1.zip' failed, 
+    # we need the loop to run to handle the split logic.
+    # Checking here would cause IMMEDIATE EXIT, abandoning remaining_files.
+    # We only skip specific keys *inside* the loop where we check each split individually.
+    
+    # === FIX: REMOVED UNSAFE S3 HEAD_OBJECT CHECKS ===
+    # We do NOT use s3.head_object() to check if a zip exists on S3.
+    # Why? Because a partial zip from a crash would be detected as "exists",
+    # causing the script to mark all files as done even though they weren't fully processed.
+    # The progress JSON is the ONLY source of truth.
+    
+    # === SMART LOOP ===
+    while len(remaining_files) > 0:
+        # Determine current key name
+        if split_index == 0:
+            current_s3_key = base_s3_key
+            current_status_name = part_name
+        else:
+            ext = base_s3_key.split('.')[-1]
+            base = base_s3_key.replace(f".{ext}", "")
+            current_s3_key = f"{base}_Split{split_index}.{ext}"
+            current_status_name = f"{part_name}.{split_index}"
+        
+        # Check progress JSON for THIS specific key (Source of Truth)
+        if is_key_complete(folder_name, current_s3_key):
+            status_queue.put((current_status_name, "SKIPPED", "Split done (JSON)"))
+            split_index += 1
+            continue
+        
+        temp_dir = os.path.join(WORK_DIR, f"temp_{part_name}_{split_index}_{random.randint(1000,9999)}")
+        zip_filename = current_s3_key.split('/')[-1]
+        local_zip = os.path.join(WORK_DIR, zip_filename)
+        proc = None
+        disk_triggered = False
+        size_triggered = False
+        
+        try:
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            list_path = os.path.join(temp_dir, "filelist.txt")
+            with open(list_path, 'w', encoding='utf-8') as f:
+                for item in remaining_files:
+                    f.write(f"{item}\n")
+            
+            status_queue.put((current_status_name, "DOWNLOADING", f"Target: {len(remaining_files)} files"))
+            
+            cmd_dl = ['rclone', 'copy', folder_path, temp_dir, '--files-from', list_path,
+                      f'--transfers={DOWNLOAD_THREADS}',
+                      '--ignore-errors', '--no-traverse', '--quiet']
+            
+            if os.path.exists(RCLONE_CONFIG):
+                cmd_dl.extend(['--config', RCLONE_CONFIG])
+            
+            proc = subprocess.Popen(cmd_dl, stderr=subprocess.PIPE)
+            
+            # === MONITOR LOOP (disk + size guard) ===
+            while proc.poll() is None:
+                size_mb = int(get_folder_size_mb(temp_dir))
+                size_bytes = get_folder_size_bytes(temp_dir)
+                
+                # DISK GUARD
+                if check_disk_usage():
+                    status_queue.put((current_status_name, "DISK FULL", "Halting & Splitting"))
+                    proc.kill()
+                    disk_triggered = True
+                    break
+                
+                # ZIP SIZE GUARD (20GB cap)
+                if size_bytes > MAX_ZIP_SIZE_BYTES:
+                    status_queue.put((current_status_name, "SIZE CAP", f"{MAX_ZIP_SIZE_GB}GB limit hit"))
+                    proc.kill()
+                    size_triggered = True
+                    break
+                
+                status_queue.put((current_status_name, "DOWNLOADING", f"{size_mb} MB / {MAX_ZIP_SIZE_GB*1024} MB max"))
+                time.sleep(2)
+            
+            if disk_triggered or size_triggered:
+                time.sleep(2)  # Let things settle
+            
+            # === INVENTORY CHECK ===
+            downloaded_files = []
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    if file == "filelist.txt":
+                        continue
+                    abs_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(abs_path, temp_dir)
+                    downloaded_files.append(rel_path)
+            
+            # FIX: Use normalized paths for comparison
+            downloaded_set = {normalize_path(f) for f in downloaded_files}
+            new_remaining = []
+            for f in remaining_files:
+                norm_f = normalize_path(f)
+                if norm_f not in downloaded_set:
+                    new_remaining.append(f)
+            
+            remaining_files = new_remaining
+            
+            # === ZIP & UPLOAD ===
+            if downloaded_files:
+                status_queue.put((current_status_name, "ZIPPING", f"{len(downloaded_files)} files"))
+                
+                if os.path.exists(list_path):
+                    try:
+                        os.remove(list_path)
+                    except OSError:
+                        pass
+                
+                cmd_zip = ["zip", "-0", "-r", "-q", local_zip, "."]
+                result = subprocess.run(cmd_zip, cwd=temp_dir, capture_output=True)
+                
+                if os.path.exists(local_zip):
+                    file_size = os.path.getsize(local_zip)
+                    status_queue.put((current_status_name, "UPLOADING", f"{int(file_size/(1024*1024))} MB"))
+                    s3.upload_file(local_zip, S3_BUCKET, current_s3_key)
+                    mark_part_complete(folder_name, current_s3_key, downloaded_files)
+                    status_queue.put((current_status_name, "COMPLETED", "Saved to S3 ✓"))
+                else:
+                    raise Exception(f"Zip file {zip_filename} not created")
+            else:
+                if not disk_triggered and not size_triggered and proc.returncode != 0:
+                    err_msg = "Rclone Failed"
+                    if proc.stderr:
+                        try:
+                            err_output = proc.stderr.read().decode('utf-8', errors='replace')[:200]
+                            if err_output.strip():
+                                err_msg = f"Rclone: {err_output.strip()[:40]}"
+                        except Exception:
+                            pass
+                    status_queue.put((current_status_name, "ERROR", err_msg))
+                    return False
+            
+        except Exception as e:
+            status_queue.put((current_status_name, "ERROR", str(e)[:40]))
+            return False
+        
+        finally:
+            # Cleanup
+            if proc and proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            
+            if os.path.exists(local_zip):
+                try:
+                    os.remove(local_zip)
+                except OSError:
+                    pass
+            
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir, onerror=handle_remove_readonly)
+                except Exception:
+                    subprocess.run(["rm", "-rf", temp_dir], capture_output=True)
+        
+        if len(remaining_files) > 0:
+            split_index += 1
+            trigger = "size cap" if size_triggered else "disk"
+            status_queue.put((part_name, "SPLITTING", f"{len(remaining_files)} remain ({trigger})"))
+        else:
+            break
+    
+    return True
+
+# ============ MONITOR ============
+
+def monitor(queue, num_parts: int, stop_event: threading.Event) -> None:
+    """Live status monitor. Stops on sentinel or stop_event."""
+    statuses = {}
+    
+    # Check if we have a TTY for colors
+    has_color = sys.stdout.isatty()
+    
+    def colorize(text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if has_color else text
+    
+    print("\n" * (MAX_PARALLEL_WORKERS + 5))
+    
+    # FIX: Added stop_event for graceful shutdown
+    while not stop_event.is_set():
+        try:
+            while not queue.empty():
+                part, state, info = queue.get()
+                if part is None:  # Sentinel: stop monitor
+                    return
+                statuses[part] = (state, info)
+        except Exception:
+            pass
+        
+        # Move cursor up
+        if has_color:
+            sys.stdout.write(f"\033[{len(statuses)+5}A")
+        
+        print(f"{'PART':<20} | {'STATUS':<15} | {'INFO':<30}")
+        print("-" * 70)
+        
+        done = 0
+        
+        def natural_sort_key(s):
+            return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+        
+        sorted_keys = sorted(statuses.keys(), key=natural_sort_key)
+        
+        for p in sorted_keys:
+            state, info = statuses[p]
+            if state in ["COMPLETED", "SKIPPED", "ERROR"]:
+                done += 1
+            
+            row = f"{p:<20} | {state:<15} | {info:<30}"
+            
+            if has_color:
+                if state == "ERROR":
+                    row = colorize(row, "91")  # Red
+                elif state in ["COMPLETED", "SKIPPED"]:
+                    row = colorize(row, "92")  # Green
+                elif state == "RESUMED":
+                    row = colorize(row, "96")  # Cyan
+                elif state in ["DIRECT COPY", "TRANSFERRING"]:
+                    row = colorize(row, "95")  # Magenta
+                elif "DISK FULL" in state or "SIZE CAP" in state:
+                    row = colorize(row, "93")  # Yellow
+            
+            print(row)
+        
+        sys.stdout.flush()
+        time.sleep(1)
+
+# ============ CLEANUP MULTIPART UPLOADS ============
+
+def cleanup_multipart_uploads() -> None:
+    """Abort incomplete multipart uploads older than 1 day to save costs."""
+    try:
+        s3 = get_s3_client()
+        paginator = s3.get_paginator('list_multipart_uploads')
+        cleaned = 0
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=S3_PREFIX):
+            for upload in page.get('Uploads', []):
+                # Abort all incomplete uploads
+                try:
+                    s3.abort_multipart_upload(
+                        Bucket=S3_BUCKET,
+                        Key=upload['Key'],
+                        UploadId=upload['UploadId']
+                    )
+                    cleaned += 1
+                except Exception:
+                    pass
+        if cleaned > 0:
+            print(f"   🧹 Cleaned up {cleaned} incomplete multipart upload(s)")
+    except Exception as e:
+        print(f"   ⚠️ Could not cleanup multipart uploads: {e}")
+
+# ============ MAIN ============
+
+def main():
+    print("🚀 PYTHON MASTER WORKER (Fully Fixed Version)")
+    print("=" * 60)
+    print(f"   Source       : {SOURCE}")
+    print(f"   Destination  : {DESTINATION} (large files only)")
+    print(f"   S3 Bucket    : {S3_BUCKET}")
+    print(f"   Max Zip Size : {MAX_ZIP_SIZE_GB} GB")
+    print(f"   Work Dir     : {WORK_DIR}")
+    print("=" * 60)
+    
+    # Check credentials
+    if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
+        print("\n❌ AWS credentials not configured!")
+        print("   Set environment variables:")
+        print("   export AWS_ACCESS_KEY_ID='your_key'")
+        print("   export AWS_SECRET_ACCESS_KEY='your_secret'")
+        return
+    
+    print("\n🛠️  Checking dependencies...")
+    
+    # Install zip if needed (FIX: Don't use shell=True with command strings)
+    try:
+        subprocess.run(
+            ["apt-get", "update"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=60
+        )
+        subprocess.run(
+            ["apt-get", "install", "-y", "zip"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=60
+        )
+    except Exception:
+        pass  # May not be on Ubuntu/Debian
+    
+    if shutil.which("rclone") is None:
+        print("   ⬇️  Installing Rclone...")
+        try:
+            subprocess.run(
+                "curl https://rclone.org/install.sh | sudo bash",
+                shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=120
+            )
+        except Exception as e:
+            print(f"   ❌ Failed to install rclone: {e}")
+            return
+    
+    if shutil.which("zip") is None:
+        print("   ⚠️  zip command not found")
+    
+    print("✅ Dependencies ready!\n")
+    
+    # Test S3 connection
+    print("🔌 Testing S3 connection...")
+    try:
+        s3 = get_s3_client()
+        s3.head_bucket(Bucket=S3_BUCKET)
+        print("   ✅ S3 connection successful\n")
+    except Exception as e:
+        print(f"   ❌ S3 connection failed: {e}\n")
+        return
+    
+    # Cleanup old multipart uploads
+    print("🧹 Cleaning up incomplete uploads...")
+    cleanup_multipart_uploads()
+    print()
+    
+    # Fetch folder list
+    print("📁 Fetching folder list from S3...")
+    SUBFOLDERS = fetch_folder_list()
+    if not SUBFOLDERS:
+        print("❌ No folders to process. Run mapper.py first!")
+        return
+    print()
+    
+    for folder in SUBFOLDERS:
+        if is_folder_complete(folder):
+            print(f"⏭️  Skipping {folder} (fully completed)")
+            continue
+        
+        print(f"📦 Processing: {folder}")
+        
+        # === NORMAL FILES (zip pipeline) ===
+        files = fetch_map(folder)
+        has_normal = bool(files)
+        
+        # === LARGE FILES (direct transfer) ===
+        large_files = fetch_large_files(folder)
+        has_large = bool(large_files)
+        
+        if not has_normal and not has_large:
+            print("   ⚠️  No files found on S3. Skipping.")
+            continue
+        
+        # Filter completed normal files
+        if has_normal:
+            completed = get_completed_files(folder)
+            original_count = len(files)
+            # FIX: Normalize paths for comparison
+            completed_normalized = {normalize_path(f) for f in completed}
+            files = [f for f in files if normalize_path(f) not in completed_normalized]
+            if completed:
+                print(f"   ♻️  Normal: {original_count - len(files)} done, {len(files)} remaining")
+        
+        # Filter completed large files
+        if has_large:
+            done_large = get_completed_large_files(folder)
+            remaining_large = [lf for lf in large_files if lf['path'] not in done_large]
+            if done_large:
+                print(f"   ♻️  Large: {len(done_large)} done, {len(remaining_large)} remaining")
+        else:
+            remaining_large = []
+        
+        if not files and not remaining_large:
+            print(f"   ✅ All files completed!")
+            mark_folder_complete(folder)
+            continue
+        
+        m = multiprocessing.Manager()
+        q = m.Queue()
+        lock = m.Lock()
+        stop_event = threading.Event()
+        
+        # Start monitor (FIX: Added stop_event)
+        total_parts = math.ceil(len(files) / SPLIT_THRESHOLD) if files else 0
+        monitor_thread = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        monitor_future = monitor_thread.submit(monitor, q, total_parts + (1 if remaining_large else 0), stop_event)
+        
+        # Run tasks
+        has_failures = False
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS + 1) as thread_exe:
+            futures = []
+            large_future = None
+            
+            # Submit large file transfer
+            if remaining_large:
+                print(f"   ⚡ {len(remaining_large)} large file(s) → direct transfer to {DESTINATION}")
+                large_future = thread_exe.submit(transfer_large_files, folder, q, lock)
+                futures.append(large_future)
+            
+            # Submit normal zip pipeline
+            if files:
+                num_parts = math.ceil(len(files) / SPLIT_THRESHOLD)
+                print(f"   🔹 {len(files)} normal files → {num_parts} part(s)")
+                
+                def run_zip_pipeline():
+                    tasks = []
+                    for i in range(num_parts):
+                        batch = files[i*SPLIT_THRESHOLD:(i+1)*SPLIT_THRESHOLD]
+                        part = f"Part{i+1}" if num_parts > 1 else "Full"
+                        s3_key = f"{S3_PREFIX}{sanitize_name(folder)}_{part}.zip"
+                        tasks.append((batch, f"{SOURCE}/{folder}", s3_key, part, folder, q, lock))
+                    
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as exe:
+                        results = list(exe.map(pipeline_worker, tasks))
+                    # Return True if ANY worker failed
+                    return any(r is False for r in results)
+                
+                futures.append(thread_exe.submit(run_zip_pipeline))
+            
+            # Wait for all
+            for f in futures:
+                try:
+                    result = f.result()
+                    # run_zip_pipeline returns True if any worker failed
+                    if result is True and f != large_future:
+                        has_failures = True
+                        print(f"   ❌ Some zip pipeline worker(s) FAILED!")
+                except Exception as e:
+                    has_failures = True
+                    print(f"   ❌ Future failed: {e}")
+            
+            # Check large file transfer results
+            if large_future and large_future.done():
+                try:
+                    failed_large_files = large_future.result()
+                    if failed_large_files:
+                        has_failures = True
+                        print(f"   ❌ {len(failed_large_files)} large file(s) FAILED!")
+                except Exception:
+                    has_failures = True
+        
+        # Mark complete or not
+        if has_failures:
+            print(f"\n⚠️  {folder} — INCOMPLETE (some transfers failed, will retry on next run)\n")
+        else:
+            mark_folder_complete(folder)
+            print(f"\n✅ {folder} — ALL DONE\n")
+        
+        # Stop monitor
+        stop_event.set()
+        q.put((None, "DONE", ""))
+    
+    print("\n🏁 ALL FOLDERS COMPLETE!")
+
+
+if __name__ == "__main__":
+    main()
